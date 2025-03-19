@@ -9,8 +9,25 @@
 #include "nimble/nimble_port_freertos.h"
 // #include "store/config/ble_store_config.h"
 #include "misc.h"
+#include "peer.h"
+
+void ble_store_config_init(void);
 
 static const char *tag = "USB_DONGLE";
+// static const uint8_t mouse_address[6] = {0xEA, 0x24, 0xC6, 0xC4, 0xCB, 0xDA};
+
+bool equals(uint8_t *arr1, uint8_t *arr2, uint8_t length)
+{
+    for (int i = 0; i < length; i++)
+    {
+        if (arr1[i] != arr2[i])
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
 
 /**
  * The nimble host executes this callback when a GAP event occurs.  The
@@ -41,17 +58,89 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
     switch (event->type)
     {
     case BLE_GAP_EVENT_DISC:
-        ESP_LOGI(tag, "BLE_GAP_EVENT_DISC");
+        // ESP_LOGI(tag, "BLE_GAP_EVENT_DISC");
         rc = ble_hs_adv_parse_fields(&fields, event->disc.data,
                                      event->disc.length_data);
 
-        if (rc != 0)
+        // bool eq = equals(event->disc.addr.val, mouse_address, 6);
+
+        char s[BLE_HS_ADV_MAX_SZ];
+
+        if (fields.name != NULL)
         {
-            return 0;
+            assert(fields.name_len < sizeof s - 1);
+            memcpy(s, fields.name, fields.name_len);
+            s[fields.name_len] = '\0';
+            // MODLOG_DFLT(DEBUG, "    name(%scomplete)=%s\n",
+            // fields.name_is_complete ? "" : "in", s);
+
+            if (strcmp(s, "MX Master 3 Mac") == 0)
+            {
+                ESP_LOGI(tag, "found mouse");
+                print_bytes(event->disc.addr.val, 6);
+                ESP_LOGI(tag, "device address type: %d", event->disc.addr.type);
+
+                rc = ble_gap_disc_cancel();
+                if (rc != 0)
+                {
+                    MODLOG_DFLT(DEBUG, "Failed to cancel scan; rc=%d\n", rc);
+                    return 0;
+                }
+                else
+                {
+                    ESP_LOGI(tag, "scan stopped");
+                }
+
+                uint8_t own_addr_type;
+                ble_addr_t *addr;
+
+                /* Figure out address to use for connect (no privacy for now) */
+                rc = ble_hs_id_infer_auto(0, &own_addr_type);
+                if (rc != 0)
+                {
+                    MODLOG_DFLT(ERROR, "error determining address type; rc=%d\n", rc);
+                    return 0;
+                }
+                else
+                {
+                    ESP_LOGI(tag, "address type found: %d", own_addr_type);
+                }
+
+                addr = &event->disc.addr;
+
+                rc = ble_gap_connect(own_addr_type, addr, 30000, NULL,
+                    on_gap_event_receive, NULL);
+                if (rc != 0)
+                {
+                    MODLOG_DFLT(ERROR, "Error: Failed to connect to device; addr_type=%d "
+                                       "addr=%s; rc=%d\n",
+                                addr->type, addr_str(addr->val), rc);
+                    return 0;
+                }
+                else
+                {
+                    ESP_LOGI(tag, "connected");
+                }
+            }
         }
-        MODLOG_DFLT(DEBUG, "%s\n", "vmi");
+
+        // if (eq)
+        // {
+        //     ESP_LOGI(tag, "mouse found!");
+
+        //     ESP_LOGI(tag, "device address type: %d", event->disc.addr.type);
+        //     print_bytes(event->disc.addr.val, 6);
+        // } else {
+        //     ESP_LOGI(tag, "not mouse");
+        // }
+
+        // if (rc != 0)
+        // {
+        // return 0;
+        // }
+        // MODLOG_DFLT(DEBUG, "%s\n", "vmi");
         /* An advertisement report was received during GAP discovery. */
-        print_adv_fields(&fields);
+        // print_adv_fields(&fields);
 
         /* Try to connect to the advertiser if it looks interesting. */
         // blecent_connect_if_interesting(&event->disc);
@@ -71,14 +160,15 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
             //              * Encryption (Enable encryption)
             //              * Will invoke event BLE_GAP_EVENT_ENC_CHANGE
             //              **/
-            //             rc = ble_gap_security_initiate(event->connect.conn_handle);
-            //             if (rc != 0) {
-            //                 MODLOG_DFLT(INFO, "Security could not be initiated, rc = %d\n", rc);
-            //                 return ble_gap_terminate(event->connect.conn_handle,
-            //                                          BLE_ERR_REM_USER_CONN_TERM);
-            //             } else {
-            //                 MODLOG_DFLT(INFO, "Connection secured\n");
-            //             }
+
+                        rc = ble_gap_security_initiate(event->connect.conn_handle);
+                        if (rc != 0) {
+                            MODLOG_DFLT(INFO, "Security could not be initiated, rc = %d\n", rc);
+                            return ble_gap_terminate(event->connect.conn_handle,
+                                                     BLE_ERR_REM_USER_CONN_TERM);
+                        } else {
+                            MODLOG_DFLT(INFO, "Connection secured\n");
+                        }
             // #else
             /* Perform service discovery */
             // rc = peer_disc_all(event->connect.conn_handle,
@@ -95,6 +185,10 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
                         event->connect.status);
         }
 
+        return 0;
+
+    case BLE_GAP_EVENT_CONNECT:
+        MODLOG_DFLT(INFO, "connect; status=%d ", event->connect.status);
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
@@ -258,16 +352,20 @@ void app_main(void)
     ble_hs_cfg.sync_cb = blecent_on_sync;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
+    /* Initialize data structures to track connected peers. */
+    rc = peer_init(MYNEWT_VAL(BLE_MAX_CONNECTIONS), 64, 64, 64);
+    assert(rc == 0);
+
     /* Set the default device name. */
     rc = ble_svc_gap_device_name_set("logitech-mx-master-3-usb-dongle");
     assert(rc == 0);
 
     /* XXX Need to have template for store */
-    // ble_store_config_init();
+    ble_store_config_init();
 
     nimble_port_freertos_init(blecent_host_task);
 
-    //scan();
+    // scan();
 
     ESP_LOGI(tag, "exit");
 }

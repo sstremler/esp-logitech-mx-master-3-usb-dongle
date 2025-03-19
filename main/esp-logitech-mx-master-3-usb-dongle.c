@@ -11,6 +11,16 @@
 #include "misc.h"
 #include "peer.h"
 
+/*** The UUID of the service containing the subscribable characteristic ***/
+static ble_uuid_any_t remote_svc_uuid;
+
+/*** The UUID of the subscribable chatacteristic ***/
+static ble_uuid_any_t remote_chr_uuid;
+
+static ble_uuid_any_t battery_svc_uuid;
+
+static ble_uuid_any_t battery_chr_uuid;
+
 void ble_store_config_init(void);
 
 static const char *tag = "USB_DONGLE";
@@ -30,16 +40,139 @@ bool equals(uint8_t *arr1, uint8_t *arr2, uint8_t length)
 }
 
 /**
+ * Application Callback. Called when the custom subscribable characteristic
+ * is subscribed to.
+ **/
+static int
+on_custom_subscribe(uint16_t conn_handle,
+                    const struct ble_gatt_error *error,
+                    struct ble_gatt_attr *attr,
+                    void *arg)
+{
+    MODLOG_DFLT(INFO,
+                "Subscribe to the custom subscribable characteristic complete; "
+                "status=%d conn_handle=%d",
+                error->status, conn_handle);
+
+    if (error->status == 0)
+    {
+        MODLOG_DFLT(INFO, " attr_handle=%d value=", attr->handle);
+        print_mbuf(attr->om);
+    }
+
+    return 0;
+}
+
+/**
+ * Application Callback. Called when the custom subscribable chatacteristic
+ * in the remote GATT server is read.
+ * Expect to get the recently written data.
+ **/
+static int
+on_custom_read(uint16_t conn_handle,
+               const struct ble_gatt_error *error,
+               struct ble_gatt_attr *attr,
+               void *arg)
+{
+    MODLOG_DFLT(INFO,
+                "Read complete for the subscribable characteristic; "
+                "status=%d conn_handle=%d",
+                error->status, conn_handle);
+    if (error->status == 0)
+    {
+        MODLOG_DFLT(INFO, " attr_handle=%d value=", attr->handle);
+        print_mbuf(attr->om);
+    }
+    MODLOG_DFLT(INFO, "\n");
+
+    return 0;
+}
+
+static void
+read_battery_status(const struct peer *peer)
+{
+    const struct peer_chr *chr;
+    int rc;
+    // uint8_t value[2];
+
+    chr = peer_chr_find_uuid(peer,
+                             (ble_uuid_t *)&battery_svc_uuid,
+                             (ble_uuid_t *)&battery_chr_uuid);
+    if (chr == NULL)
+    {
+        MODLOG_DFLT(ERROR,
+                    "Error: Peer doesn't have the custom subscribable characteristic\n");
+        goto err;
+    }
+
+    /*** Performs a read on the characteristic, the result is handled in blecent_on_new_read callback ***/
+    rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle,
+                        on_custom_read, NULL);
+    if (rc != 0)
+    {
+        MODLOG_DFLT(ERROR,
+                    "Error: Failed to read the custom subscribable characteristic; "
+                    "rc=%d\n",
+                    rc);
+        goto err;
+    }
+
+    return;
+err:
+    /* Terminate the connection */
+    ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+}
+
+static void
+subscribe_to_mouse_events(const struct peer *peer)
+{
+    const struct peer_dsc *dsc;
+    int rc;
+    uint8_t value[2];
+
+    dsc = peer_dsc_find_uuid(peer,
+                             (ble_uuid_t *)&remote_svc_uuid,
+                             (ble_uuid_t *)&remote_chr_uuid,
+                             BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
+    if (dsc == NULL)
+    {
+        MODLOG_DFLT(ERROR, "Error: Peer lacks a CCCD for the subscribable characteristic\n");
+        goto err;
+    }
+
+    /*** Write 0x00 and 0x01 (The subscription code) to the CCCD ***/
+    value[0] = 1;
+    value[1] = 0;
+    rc = ble_gattc_write_flat(peer->conn_handle, dsc->dsc.handle,
+                              value, sizeof(value), on_custom_subscribe, NULL);
+    if (rc != 0)
+    {
+        MODLOG_DFLT(ERROR,
+                    "Error: Failed to subscribe to the subscribable characteristic; "
+                    "rc=%d\n",
+                    rc);
+        goto err;
+    }
+
+    return;
+err:
+    /* Terminate the connection */
+    ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+}
+
+/**
  * Called when service discovery of the specified peer has completed.
  */
 static void
 on_disc_complete(const struct peer *peer, int status, void *arg)
 {
 
-    if (status != 0) {
+    if (status != 0)
+    {
         /* Service discovery failed.  Terminate the connection. */
         MODLOG_DFLT(ERROR, "Error: Service discovery failed; status=%d "
-                    "conn_handle=%d\n", status, peer->conn_handle);
+                           "conn_handle=%d\n",
+                    status, peer->conn_handle);
         ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return;
     }
@@ -49,12 +182,14 @@ on_disc_complete(const struct peer *peer, int status, void *arg)
      * supports.
      */
     MODLOG_DFLT(INFO, "Service discovery complete; status=%d "
-                "conn_handle=%d\n", status, peer->conn_handle);
+                      "conn_handle=%d\n",
+                status, peer->conn_handle);
 
     /* Now perform three GATT procedures against the peer: read,
      * write, and subscribe to notifications for the ANS service.
      */
-    // blecent_read_write_subscribe(peer);
+    subscribe_to_mouse_events(peer);
+    // read_battery_status(peer);
 }
 
 /**
@@ -188,7 +323,8 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
 
             /* Remember peer. */
             rc = peer_add(event->connect.conn_handle);
-            if (rc != 0) {
+            if (rc != 0)
+            {
                 MODLOG_DFLT(ERROR, "Failed to add peer; rc=%d\n", rc);
                 return 0;
             }
@@ -376,6 +512,12 @@ void blecent_host_task(void *param)
 void app_main(void)
 {
     ESP_LOGI(tag, "program started");
+
+    ble_uuid_from_str(&battery_svc_uuid, "0000180f-0000-1000-8000-00805f9b34fb");
+    ble_uuid_from_str(&battery_chr_uuid, "00002a19-0000-1000-8000-00805f9b34fb");
+
+    ble_uuid_from_str(&remote_svc_uuid, "00001801-0000-1000-8000-00805f9b34fb");
+    ble_uuid_from_str(&remote_chr_uuid, "00002a05-0000-1000-8000-00805f9b34fb");
 
     int rc;
     esp_err_t ret = nvs_flash_init();

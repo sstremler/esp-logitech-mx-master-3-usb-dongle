@@ -30,6 +30,34 @@ bool equals(uint8_t *arr1, uint8_t *arr2, uint8_t length)
 }
 
 /**
+ * Called when service discovery of the specified peer has completed.
+ */
+static void
+on_disc_complete(const struct peer *peer, int status, void *arg)
+{
+
+    if (status != 0) {
+        /* Service discovery failed.  Terminate the connection. */
+        MODLOG_DFLT(ERROR, "Error: Service discovery failed; status=%d "
+                    "conn_handle=%d\n", status, peer->conn_handle);
+        ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+
+    /* Service discovery has completed successfully.  Now we have a complete
+     * list of services, characteristics, and descriptors that the peer
+     * supports.
+     */
+    MODLOG_DFLT(INFO, "Service discovery complete; status=%d "
+                "conn_handle=%d\n", status, peer->conn_handle);
+
+    /* Now perform three GATT procedures against the peer: read,
+     * write, and subscribe to notifications for the ANS service.
+     */
+    // blecent_read_write_subscribe(peer);
+}
+
+/**
  * The nimble host executes this callback when a GAP event occurs.  The
  * application associates a GAP event callback with each connection that is
  * established.  blecent uses the same callback for all connections.
@@ -46,7 +74,7 @@ bool equals(uint8_t *arr1, uint8_t *arr2, uint8_t length)
 static int
 on_gap_event_receive(struct ble_gap_event *event, void *arg)
 {
-    // struct ble_gap_conn_desc desc;
+    struct ble_gap_conn_desc desc;
     struct ble_hs_adv_fields fields;
 #if MYNEWT_VAL(BLE_HCI_VS)
 #if MYNEWT_VAL(BLE_POWER_CONTROL)
@@ -109,7 +137,7 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
                 addr = &event->disc.addr;
 
                 rc = ble_gap_connect(own_addr_type, addr, 30000, NULL,
-                    on_gap_event_receive, NULL);
+                                     on_gap_event_receive, NULL);
                 if (rc != 0)
                 {
                     MODLOG_DFLT(ERROR, "Error: Failed to connect to device; addr_type=%d "
@@ -153,6 +181,18 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
             /* Connection successfully established. */
             MODLOG_DFLT(INFO, "Connection established ");
 
+            rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+            assert(rc == 0);
+            print_conn_desc(&desc);
+            MODLOG_DFLT(INFO, "\n");
+
+            /* Remember peer. */
+            rc = peer_add(event->connect.conn_handle);
+            if (rc != 0) {
+                MODLOG_DFLT(ERROR, "Failed to add peer; rc=%d\n", rc);
+                return 0;
+            }
+
             // #if CONFIG_EXAMPLE_ENCRYPTION
             //             /** Initiate security - It will perform
             //              * Pairing (Exchange keys)
@@ -161,14 +201,17 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
             //              * Will invoke event BLE_GAP_EVENT_ENC_CHANGE
             //              **/
 
-                        rc = ble_gap_security_initiate(event->connect.conn_handle);
-                        if (rc != 0) {
-                            MODLOG_DFLT(INFO, "Security could not be initiated, rc = %d\n", rc);
-                            return ble_gap_terminate(event->connect.conn_handle,
-                                                     BLE_ERR_REM_USER_CONN_TERM);
-                        } else {
-                            MODLOG_DFLT(INFO, "Connection secured\n");
-                        }
+            rc = ble_gap_security_initiate(event->connect.conn_handle);
+            if (rc != 0)
+            {
+                MODLOG_DFLT(INFO, "Security could not be initiated, rc = %d\n", rc);
+                return ble_gap_terminate(event->connect.conn_handle,
+                                         BLE_ERR_REM_USER_CONN_TERM);
+            }
+            else
+            {
+                MODLOG_DFLT(INFO, "Connection secured\n");
+            }
             // #else
             /* Perform service discovery */
             // rc = peer_disc_all(event->connect.conn_handle,
@@ -205,18 +248,21 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
         /* Encryption has been enabled or disabled for this connection. */
         MODLOG_DFLT(INFO, "encryption change event; status=%d ",
                     event->enc_change.status);
-        //         rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
-        //         assert(rc == 0);
-        //         print_conn_desc(&desc);
-        // #if CONFIG_EXAMPLE_ENCRYPTION
-        //         /*** Go for service discovery after encryption has been successfully enabled ***/
-        //         rc = peer_disc_all(event->connect.conn_handle,
-        //                            blecent_on_disc_complete, NULL);
-        //         if (rc != 0) {
-        //             MODLOG_DFLT(ERROR, "Failed to discover services; rc=%d\n", rc);
-        //             return 0;
-        //         }
-        // #endif
+        rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
+        assert(rc == 0);
+        print_conn_desc(&desc);
+
+        ESP_LOGI(tag, "event->enc_change.conn_handle: %d", event->enc_change.conn_handle);
+        ESP_LOGI(tag, "event->connect.conn_handle: %d", event->connect.conn_handle);
+
+        /*** Go for service discovery after encryption has been successfully enabled ***/
+        rc = peer_disc_all(event->connect.conn_handle, on_disc_complete, NULL);
+        if (rc != 0)
+        {
+            MODLOG_DFLT(ERROR, "Failed to discover services; rc=%d\n", rc);
+            return 0;
+        }
+
         return 0;
 
     case BLE_GAP_EVENT_NOTIFY_RX:

@@ -81,7 +81,13 @@ on_custom_read(uint16_t conn_handle,
     if (error->status == 0)
     {
         MODLOG_DFLT(INFO, " attr_handle=%d value=", attr->handle);
-        print_mbuf(attr->om);
+        // print_mbuf(attr->om);
+        ESP_LOGI("BLE", "Read successful. Value:");
+
+        for (int i = 0; i < attr->om->om_len; i++)
+        {
+            ESP_LOGI(tag, "0x%02X ", attr->om->om_data[i]); // Print each byte in hex
+        }
     }
     MODLOG_DFLT(INFO, "\n");
 
@@ -105,9 +111,11 @@ read_battery_status(const struct peer *peer)
         goto err;
     }
 
+    ESP_LOGI(tag, "read handle: 0x%02X", chr->chr.val_handle);
+
     /*** Performs a read on the characteristic, the result is handled in blecent_on_new_read callback ***/
-    rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle,
-                        on_custom_read, NULL);
+    rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle, on_custom_read, NULL);
+
     if (rc != 0)
     {
         MODLOG_DFLT(ERROR,
@@ -124,7 +132,7 @@ err:
 }
 
 static void
-subscribe_to_mouse_events(const struct peer *peer)
+subscribe_to_mouse_events(const struct peer *peer, uint16_t handle)
 {
     const struct peer_dsc *dsc;
     int rc;
@@ -140,10 +148,12 @@ subscribe_to_mouse_events(const struct peer *peer)
         goto err;
     }
 
+    ESP_LOGI(tag, "subscribe to mouse events, handle: 0x%02X", handle);
+
     /*** Write 0x00 and 0x01 (The subscription code) to the CCCD ***/
     value[0] = 1;
     value[1] = 0;
-    rc = ble_gattc_write_flat(peer->conn_handle, dsc->dsc.handle,
+    rc = ble_gattc_write_flat(peer->conn_handle, handle,
                               value, sizeof(value), on_custom_subscribe, NULL);
     if (rc != 0)
     {
@@ -188,7 +198,8 @@ on_disc_complete(const struct peer *peer, int status, void *arg)
     /* Now perform three GATT procedures against the peer: read,
      * write, and subscribe to notifications for the ANS service.
      */
-    subscribe_to_mouse_events(peer);
+    // subscribe to thumb button events
+    subscribe_to_mouse_events(peer, 0x0030);
     // read_battery_status(peer);
 }
 
@@ -403,12 +414,25 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_NOTIFY_RX:
         /* Peer sent us a notification or indication. */
+        int len = OS_MBUF_PKTLEN(event->notify_rx.om);
         MODLOG_DFLT(INFO, "received %s; conn_handle=%d attr_handle=%d "
                           "attr_len=%d\n",
                     event->notify_rx.indication ? "indication" : "notification",
                     event->notify_rx.conn_handle,
                     event->notify_rx.attr_handle,
-                    OS_MBUF_PKTLEN(event->notify_rx.om));
+                    len);
+
+                    uint8_t *buf = malloc(len + 1);
+        os_mbuf_copydata(event->notify_rx.om, 0, len, buf);
+
+        for (int i = 0; i < len; i++) {
+            printf("%02X ", buf[i]);
+        }
+        printf("\n");
+
+        if(event->notify_rx.attr_handle == 47) {
+            ESP_LOGI(tag, "thumb button pressed");
+        }
 
         /* Attribute data is contained in event->notify_rx.om. Use
          * `os_mbuf_copydata` to copy the data received in notification mbuf */
@@ -516,8 +540,8 @@ void app_main(void)
     ble_uuid_from_str(&battery_svc_uuid, "0000180f-0000-1000-8000-00805f9b34fb");
     ble_uuid_from_str(&battery_chr_uuid, "00002a19-0000-1000-8000-00805f9b34fb");
 
-    ble_uuid_from_str(&remote_svc_uuid, "00001801-0000-1000-8000-00805f9b34fb");
-    ble_uuid_from_str(&remote_chr_uuid, "00002a05-0000-1000-8000-00805f9b34fb");
+    ble_uuid_from_str(&remote_svc_uuid, "1812");
+    ble_uuid_from_str(&remote_chr_uuid, "2a4d");
 
     int rc;
     esp_err_t ret = nvs_flash_init();

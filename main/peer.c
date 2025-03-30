@@ -9,6 +9,8 @@
 #include "host/ble_hs.h"
 #include "esp_central.h"
 
+static const char *TAG = "USB_DONGLE";
+
 static void *peer_svc_mem;
 static struct os_mempool peer_svc_pool;
 
@@ -405,6 +407,13 @@ peer_chr_disced(uint16_t conn_handle, const struct ble_gatt_error *error,
     {
     case 0:
         rc = peer_chr_add(peer, peer->cur_svc->svc.start_handle, chr);
+
+        // char uuid_str[BLE_UUID_STR_LEN];
+        // ble_uuid_to_str(&chr->uuid.u, uuid_str);
+    
+        // ESP_LOGI(TAG, "Characteristics discovered: defhandle=%04x, UUID=%s, valuehandle=%04x, properties=%04x",
+        //          chr->def_handle, uuid_str, chr->val_handle, chr->properties);
+
         break;
 
     case BLE_HS_EDONE:
@@ -663,6 +672,14 @@ peer_svc_disced(uint16_t conn_handle, const struct ble_gatt_error *error,
     {
     case 0:
         rc = peer_svc_add(peer, service);
+
+        // char uuid_str[BLE_UUID_STR_LEN];
+        // ble_uuid_to_str(&service->uuid.u, uuid_str);
+    
+        // ESP_LOGI(TAG, "Service discovered: start handle=%04x, end handle=%04x, UUID=%s",
+        //          service->start_handle, service->end_handle, uuid_str);
+
+
         break;
 
     case BLE_HS_EDONE:

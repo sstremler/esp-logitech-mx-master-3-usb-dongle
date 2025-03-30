@@ -430,7 +430,7 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
         }
         printf("\n");
 
-        if(event->notify_rx.attr_handle == 47) {
+        if(event->notify_rx.attr_handle == 0x2F) {
             ESP_LOGI(tag, "thumb button pressed");
         }
 

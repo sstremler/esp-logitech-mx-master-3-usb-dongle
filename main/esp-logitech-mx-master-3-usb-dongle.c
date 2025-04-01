@@ -7,47 +7,66 @@
 #include "services/gap/ble_svc_gap.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
-// #include "store/config/ble_store_config.h"
 #include "misc.h"
 #include "peer.h"
+#include "tinyusb.h"
+#include <inttypes.h>
 
-/*** The UUID of the service containing the subscribable characteristic ***/
-static ble_uuid_any_t remote_svc_uuid;
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_HID * TUD_HID_DESC_LEN)
 
-/*** The UUID of the subscribable chatacteristic ***/
-static ble_uuid_any_t remote_chr_uuid;
-
+static ble_uuid_any_t hid_over_gatt_svc_uuid;
+static ble_uuid_any_t hid_over_gatt_chr_uuid;
 static ble_uuid_any_t battery_svc_uuid;
-
 static ble_uuid_any_t battery_chr_uuid;
+
+static const char *tag = "LOGITECH_DONGLE";
+
+const uint8_t hid_report_descriptor[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(HID_ITF_PROTOCOL_KEYBOARD)),
+    TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(HID_ITF_PROTOCOL_MOUSE))};
+
+const char *hid_string_descriptor[5] = {
+    (char[]){0x09, 0x04},    // 0: is supported language is English (0x0409)
+    "Logitech",              // 1: Manufacturer
+    "MX Master 3",           // 2: Product
+    "123456",                // 3: Serials, should use chip ID
+    "Example HID interface", // 4: HID
+};
+
+static const uint8_t hid_configuration_descriptor[] = {
+    // Configuration number, interface count, string index, total length, attribute, power in mA
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+
+    // Interface number, string index, boot protocol, report descriptor len, EP In address, size & polling interval
+    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, 16, 10),
+};
 
 void ble_store_config_init(void);
 
-static const char *tag = "USB_DONGLE";
-// static const uint8_t mouse_address[6] = {0xEA, 0x24, 0xC6, 0xC4, 0xCB, 0xDA};
-
-bool equals(uint8_t *arr1, uint8_t *arr2, uint8_t length)
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
-    for (int i = 0; i < length; i++)
-    {
-        if (arr1[i] != arr2[i])
-        {
-            return false;
-        }
-    }
-
-    return true;
+    return hid_report_descriptor;
 }
 
-/**
- * Application Callback. Called when the custom subscribable characteristic
- * is subscribed to.
- **/
-static int
-on_custom_subscribe(uint16_t conn_handle,
-                    const struct ble_gatt_error *error,
-                    struct ble_gatt_attr *attr,
-                    void *arg)
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
+{
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)reqlen;
+
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
+{
+}
+
+static int on_characteristic_subscribe(uint16_t conn_handle,
+                                       const struct ble_gatt_error *error,
+                                       struct ble_gatt_attr *attr,
+                                       void *arg)
 {
     MODLOG_DFLT(INFO,
                 "Subscribe to the custom subscribable characteristic complete; "
@@ -63,58 +82,49 @@ on_custom_subscribe(uint16_t conn_handle,
     return 0;
 }
 
-/**
- * Application Callback. Called when the custom subscribable chatacteristic
- * in the remote GATT server is read.
- * Expect to get the recently written data.
- **/
-static int
-on_custom_read(uint16_t conn_handle,
-               const struct ble_gatt_error *error,
-               struct ble_gatt_attr *attr,
-               void *arg)
+static int on_characteristic_read(uint16_t conn_handle,
+                                  const struct ble_gatt_error *error,
+                                  struct ble_gatt_attr *attr,
+                                  void *arg)
 {
     MODLOG_DFLT(INFO,
                 "Read complete for the subscribable characteristic; "
                 "status=%d conn_handle=%d",
                 error->status, conn_handle);
+
     if (error->status == 0)
     {
         MODLOG_DFLT(INFO, " attr_handle=%d value=", attr->handle);
-        // print_mbuf(attr->om);
-        ESP_LOGI("BLE", "Read successful. Value:");
+        ESP_LOGI(tag, "Read successful. Value:");
 
         for (int i = 0; i < attr->om->om_len; i++)
         {
-            ESP_LOGI(tag, "0x%02X ", attr->om->om_data[i]); // Print each byte in hex
+            ESP_LOGI(tag, "0x%02X ", attr->om->om_data[i]);
         }
     }
+
     MODLOG_DFLT(INFO, "\n");
 
     return 0;
 }
 
-static void
-read_battery_status(const struct peer *peer)
+static void read_battery_status(const struct peer *peer)
 {
     const struct peer_chr *chr;
     int rc;
-    // uint8_t value[2];
 
     chr = peer_chr_find_uuid(peer,
                              (ble_uuid_t *)&battery_svc_uuid,
                              (ble_uuid_t *)&battery_chr_uuid);
     if (chr == NULL)
     {
-        MODLOG_DFLT(ERROR,
-                    "Error: Peer doesn't have the custom subscribable characteristic\n");
+        MODLOG_DFLT(ERROR, "Error: Peer doesn't have the custom subscribable characteristic\n");
         goto err;
     }
 
     ESP_LOGI(tag, "read handle: 0x%02X", chr->chr.val_handle);
 
-    /*** Performs a read on the characteristic, the result is handled in blecent_on_new_read callback ***/
-    rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle, on_custom_read, NULL);
+    rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle, on_characteristic_read, NULL);
 
     if (rc != 0)
     {
@@ -122,25 +132,22 @@ read_battery_status(const struct peer *peer)
                     "Error: Failed to read the custom subscribable characteristic; "
                     "rc=%d\n",
                     rc);
-        goto err;
+        /* Terminate the connection */
+        ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
 
     return;
-err:
-    /* Terminate the connection */
-    ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
-static void
-subscribe_to_mouse_events(const struct peer *peer, uint16_t handle)
+static void subscribe_to_mouse_events(const struct peer *peer, uint16_t handle)
 {
     const struct peer_dsc *dsc;
     int rc;
     uint8_t value[2];
 
     dsc = peer_dsc_find_uuid(peer,
-                             (ble_uuid_t *)&remote_svc_uuid,
-                             (ble_uuid_t *)&remote_chr_uuid,
+                             (ble_uuid_t *)&hid_over_gatt_svc_uuid,
+                             (ble_uuid_t *)&hid_over_gatt_chr_uuid,
                              BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
     if (dsc == NULL)
     {
@@ -154,32 +161,26 @@ subscribe_to_mouse_events(const struct peer *peer, uint16_t handle)
     value[0] = 1;
     value[1] = 0;
     rc = ble_gattc_write_flat(peer->conn_handle, handle,
-                              value, sizeof(value), on_custom_subscribe, NULL);
+                              value, sizeof(value), on_characteristic_subscribe, NULL);
     if (rc != 0)
     {
         MODLOG_DFLT(ERROR,
                     "Error: Failed to subscribe to the subscribable characteristic; "
                     "rc=%d\n",
                     rc);
-        goto err;
+        /* Terminate the connection */
+        ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
 
     return;
-err:
-    /* Terminate the connection */
-    ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
 }
 
-/**
- * Called when service discovery of the specified peer has completed.
- */
-static void
-on_disc_complete(const struct peer *peer, int status, void *arg)
+static void on_service_discovery_complete(const struct peer *peer, int status, void *arg)
 {
 
     if (status != 0)
     {
-        /* Service discovery failed.  Terminate the connection. */
+        /* Service discovery failed. Terminate the connection. */
         MODLOG_DFLT(ERROR, "Error: Service discovery failed; status=%d "
                            "conn_handle=%d\n",
                     status, peer->conn_handle);
@@ -187,57 +188,29 @@ on_disc_complete(const struct peer *peer, int status, void *arg)
         return;
     }
 
-    /* Service discovery has completed successfully.  Now we have a complete
-     * list of services, characteristics, and descriptors that the peer
-     * supports.
-     */
     MODLOG_DFLT(INFO, "Service discovery complete; status=%d "
                       "conn_handle=%d\n",
                 status, peer->conn_handle);
 
-    /* Now perform three GATT procedures against the peer: read,
-     * write, and subscribe to notifications for the ANS service.
-     */
-    // subscribe to thumb button events
+    // Subscribe to thumb button events.
     subscribe_to_mouse_events(peer, 0x0030);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    // Subscribe to scroll and click events.
+    subscribe_to_mouse_events(peer, 0x0034);
     // read_battery_status(peer);
 }
 
-/**
- * The nimble host executes this callback when a GAP event occurs.  The
- * application associates a GAP event callback with each connection that is
- * established.  blecent uses the same callback for all connections.
- *
- * @param event                 The event being signalled.
- * @param arg                   Application-specified argument; unused by
- *                                  blecent.
- *
- * @return                      0 if the application successfully handled the
- *                                  event; nonzero on failure.  The semantics
- *                                  of the return code is specific to the
- *                                  particular GAP event being signalled.
- */
-static int
-on_gap_event_receive(struct ble_gap_event *event, void *arg)
+static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
 {
     struct ble_gap_conn_desc desc;
     struct ble_hs_adv_fields fields;
-#if MYNEWT_VAL(BLE_HCI_VS)
-#if MYNEWT_VAL(BLE_POWER_CONTROL)
-    struct ble_gap_set_auto_pcl_params params;
-#endif
-#endif
     int rc;
 
     switch (event->type)
     {
     case BLE_GAP_EVENT_DISC:
-        // ESP_LOGI(tag, "BLE_GAP_EVENT_DISC");
-        rc = ble_hs_adv_parse_fields(&fields, event->disc.data,
-                                     event->disc.length_data);
-
-        // bool eq = equals(event->disc.addr.val, mouse_address, 6);
-
+        /* A new device was discovered. */
+        rc = ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data);
         char s[BLE_HS_ADV_MAX_SZ];
 
         if (fields.name != NULL)
@@ -245,14 +218,11 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
             assert(fields.name_len < sizeof s - 1);
             memcpy(s, fields.name, fields.name_len);
             s[fields.name_len] = '\0';
-            // MODLOG_DFLT(DEBUG, "    name(%scomplete)=%s\n",
-            // fields.name_is_complete ? "" : "in", s);
 
             if (strcmp(s, "MX Master 3 Mac") == 0)
             {
-                ESP_LOGI(tag, "found mouse");
+                ESP_LOGI(tag, "Found mouse");
                 print_bytes(event->disc.addr.val, 6);
-                ESP_LOGI(tag, "device address type: %d", event->disc.addr.type);
 
                 rc = ble_gap_disc_cancel();
                 if (rc != 0)
@@ -262,7 +232,7 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
                 }
                 else
                 {
-                    ESP_LOGI(tag, "scan stopped");
+                    ESP_LOGI(tag, "Scan stopped");
                 }
 
                 uint8_t own_addr_type;
@@ -281,7 +251,6 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
                 }
 
                 addr = &event->disc.addr;
-
                 rc = ble_gap_connect(own_addr_type, addr, 30000, NULL,
                                      on_gap_event_receive, NULL);
                 if (rc != 0)
@@ -293,38 +262,17 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
                 }
                 else
                 {
-                    ESP_LOGI(tag, "connected");
+                    ESP_LOGI(tag, "Connected to mouse");
                 }
             }
         }
 
-        // if (eq)
-        // {
-        //     ESP_LOGI(tag, "mouse found!");
-
-        //     ESP_LOGI(tag, "device address type: %d", event->disc.addr.type);
-        //     print_bytes(event->disc.addr.val, 6);
-        // } else {
-        //     ESP_LOGI(tag, "not mouse");
-        // }
-
-        // if (rc != 0)
-        // {
-        // return 0;
-        // }
-        // MODLOG_DFLT(DEBUG, "%s\n", "vmi");
-        /* An advertisement report was received during GAP discovery. */
-        // print_adv_fields(&fields);
-
-        /* Try to connect to the advertiser if it looks interesting. */
-        // blecent_connect_if_interesting(&event->disc);
         return 0;
 
     case BLE_GAP_EVENT_LINK_ESTAB:
         /* A new connection was established or a connection attempt failed. */
         if (event->connect.status == 0)
         {
-            /* Connection successfully established. */
             MODLOG_DFLT(INFO, "Connection established ");
 
             rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
@@ -340,14 +288,6 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
                 return 0;
             }
 
-            // #if CONFIG_EXAMPLE_ENCRYPTION
-            //             /** Initiate security - It will perform
-            //              * Pairing (Exchange keys)
-            //              * Bonding (Store keys)
-            //              * Encryption (Enable encryption)
-            //              * Will invoke event BLE_GAP_EVENT_ENC_CHANGE
-            //              **/
-
             rc = ble_gap_security_initiate(event->connect.conn_handle);
             if (rc != 0)
             {
@@ -359,18 +299,9 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
             {
                 MODLOG_DFLT(INFO, "Connection secured\n");
             }
-            // #else
-            /* Perform service discovery */
-            // rc = peer_disc_all(event->connect.conn_handle,
-            //             blecent_on_disc_complete, NULL);
-            // if(rc != 0) {
-            //     MODLOG_DFLT(ERROR, "Failed to discover services; rc=%d\n", rc);
-            //     return 0;
-            // }
         }
         else
         {
-            /* Connection attempt failed; resume scanning. */
             MODLOG_DFLT(ERROR, "Error: Connection failed; status=%d\n",
                         event->connect.status);
         }
@@ -399,11 +330,8 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
         assert(rc == 0);
         print_conn_desc(&desc);
 
-        ESP_LOGI(tag, "event->enc_change.conn_handle: %d", event->enc_change.conn_handle);
-        ESP_LOGI(tag, "event->connect.conn_handle: %d", event->connect.conn_handle);
-
         /*** Go for service discovery after encryption has been successfully enabled ***/
-        rc = peer_disc_all(event->connect.conn_handle, on_disc_complete, NULL);
+        rc = peer_disc_all(event->connect.conn_handle, on_service_discovery_complete, NULL);
         if (rc != 0)
         {
             MODLOG_DFLT(ERROR, "Failed to discover services; rc=%d\n", rc);
@@ -422,20 +350,38 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
                     event->notify_rx.attr_handle,
                     len);
 
-                    uint8_t *buf = malloc(len + 1);
+        uint8_t *buf = malloc(len + 1);
         os_mbuf_copydata(event->notify_rx.om, 0, len, buf);
 
-        for (int i = 0; i < len; i++) {
-            printf("%02X ", buf[i]);
-        }
-        printf("\n");
+        if (event->notify_rx.attr_handle == 0x33)
+        {
+            if (tud_hid_ready())
+            {
+                int32_t val = (buf[4] << 16) | (buf[3] << 8) | buf[2];
+                int32_t x = val >> 12;
+                if (x & 0x800)
+                {
+                    x |= 0xFFFFF000; // Sign extend if negative
+                }
 
-        if(event->notify_rx.attr_handle == 0x2F) {
-            ESP_LOGI(tag, "thumb button pressed");
+                int32_t y = val & 0x00000FFF;
+                if (y & 0x800)
+                {
+                    y |= 0xFFFFF000; // Sign extend if negative
+                }
+
+                tud_hid_mouse_report(HID_ITF_PROTOCOL_MOUSE, buf[0], y, x, buf[5], buf[6]);
+            }
+        }
+        else if (event->notify_rx.attr_handle == 0x2F)
+        {
+            int modifier = buf[0];
+            uint8_t keycode[6] = {0};
+
+            memcpy(keycode, buf + 1, (len - 1) > 6 ? 6 : (len - 1));
+            tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, modifier, keycode);
         }
 
-        /* Attribute data is contained in event->notify_rx.om. Use
-         * `os_mbuf_copydata` to copy the data received in notification mbuf */
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -445,12 +391,12 @@ on_gap_event_receive(struct ble_gap_event *event, void *arg)
                     event->mtu.value);
         return 0;
 
-    // case BLE_GAP_EVENT_REPEAT_PAIRING:
-    //     /* We already have a bond with the peer, but it is attempting to
-    //      * establish a new secure link.  This app sacrifices security for
-    //      * convenience: just throw away the old bond and accept the new link.
-    //      */
-
+    case BLE_GAP_EVENT_REPEAT_PAIRING:
+        /* We already have a bond with the peer, but it is attempting to
+         * establish a new secure link.  This app sacrifices security for
+         * convenience: just throw away the old bond and accept the new link.
+         */
+            ESP_LOGI(tag, "Repeat pairing.");
     //     /* Delete the old bond. */
     //     rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
     //     assert(rc == 0);
@@ -471,7 +417,6 @@ static void scan(void)
     struct ble_gap_disc_params disc_params;
     int rc;
 
-    /* Figure out address to use while advertising (no privacy for now) */
     rc = ble_hs_id_infer_auto(0, &own_addr_type);
     if (rc != 0)
     {
@@ -490,7 +435,6 @@ static void scan(void)
      */
     disc_params.passive = 1;
 
-    /* Use defaults for the rest of the parameters. */
     disc_params.itvl = 10;
     disc_params.window = 10;
     disc_params.filter_policy = 0;
@@ -505,51 +449,55 @@ static void scan(void)
     }
 }
 
-static void blecent_on_reset(int reason)
+static void on_reset(int reason)
 {
     MODLOG_DFLT(ERROR, "Resetting state; reason=%d\n", reason);
 }
 
-static void blecent_on_sync(void)
+static void on_sync(void)
 {
     int rc;
 
     /* Make sure we have proper identity address set (public preferred) */
     rc = ble_hs_util_ensure_addr(0);
     assert(rc == 0);
-
-#if !CONFIG_EXAMPLE_INIT_DEINIT_LOOP
-    /* Begin scanning for a peripheral to connect to. */
-    scan();
-#endif
 }
 
-void blecent_host_task(void *param)
+void host_task(void *param)
 {
     ESP_LOGI(tag, "BLE Host Task Started");
     /* This function will return only when nimble_port_stop() is executed */
     nimble_port_run();
-
     nimble_port_freertos_deinit();
 }
 
 void app_main(void)
 {
-    ESP_LOGI(tag, "program started");
+    ESP_LOGI(tag, "USB initialization");
+    const tinyusb_config_t tusb_cfg = {
+        .device_descriptor = NULL,
+        .string_descriptor = hid_string_descriptor,
+        .external_phy = false,
+        .configuration_descriptor = hid_configuration_descriptor,
+    };
+
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+    ESP_LOGI(tag, "USB initialization DONE");
 
     ble_uuid_from_str(&battery_svc_uuid, "0000180f-0000-1000-8000-00805f9b34fb");
     ble_uuid_from_str(&battery_chr_uuid, "00002a19-0000-1000-8000-00805f9b34fb");
 
-    ble_uuid_from_str(&remote_svc_uuid, "1812");
-    ble_uuid_from_str(&remote_chr_uuid, "2a4d");
+    ble_uuid_from_str(&hid_over_gatt_svc_uuid, "1812");
+    ble_uuid_from_str(&hid_over_gatt_chr_uuid, "2a4d");
 
-    int rc;
     esp_err_t ret = nvs_flash_init();
+
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
+
     ESP_ERROR_CHECK(ret);
 
     ret = nimble_port_init();
@@ -560,24 +508,18 @@ void app_main(void)
     }
 
     /* Configure the host. */
-    ble_hs_cfg.reset_cb = blecent_on_reset;
-    ble_hs_cfg.sync_cb = blecent_on_sync;
+    ble_hs_cfg.reset_cb = on_reset;
+    ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
     /* Initialize data structures to track connected peers. */
-    rc = peer_init(MYNEWT_VAL(BLE_MAX_CONNECTIONS), 64, 64, 64);
+    int rc = peer_init(MYNEWT_VAL(BLE_MAX_CONNECTIONS), 64, 64, 64);
     assert(rc == 0);
 
     /* Set the default device name. */
     rc = ble_svc_gap_device_name_set("logitech-mx-master-3-usb-dongle");
     assert(rc == 0);
 
-    /* XXX Need to have template for store */
     ble_store_config_init();
-
-    nimble_port_freertos_init(blecent_host_task);
-
-    // scan();
-
-    ESP_LOGI(tag, "exit");
+    nimble_port_freertos_init(host_task);
 }

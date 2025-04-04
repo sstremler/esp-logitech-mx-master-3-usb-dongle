@@ -42,6 +42,7 @@ static const uint8_t hid_configuration_descriptor[] = {
 };
 
 void ble_store_config_init(void);
+static void scan(void);
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
@@ -119,21 +120,24 @@ static void read_battery_status(const struct peer *peer)
     if (chr == NULL)
     {
         MODLOG_DFLT(ERROR, "Error: Peer doesn't have the custom subscribable characteristic\n");
-        goto err;
-    }
-
-    ESP_LOGI(tag, "read handle: 0x%02X", chr->chr.val_handle);
-
-    rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle, on_characteristic_read, NULL);
-
-    if (rc != 0)
-    {
-        MODLOG_DFLT(ERROR,
-                    "Error: Failed to read the custom subscribable characteristic; "
-                    "rc=%d\n",
-                    rc);
         /* Terminate the connection */
         ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    else
+    {
+        ESP_LOGI(tag, "read handle: 0x%02X", chr->chr.val_handle);
+
+        rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle, on_characteristic_read, NULL);
+
+        if (rc != 0)
+        {
+            MODLOG_DFLT(ERROR,
+                        "Error: Failed to read the custom subscribable characteristic; "
+                        "rc=%d\n",
+                        rc);
+            /* Terminate the connection */
+            ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
     }
 
     return;
@@ -152,24 +156,27 @@ static void subscribe_to_mouse_events(const struct peer *peer, uint16_t handle)
     if (dsc == NULL)
     {
         MODLOG_DFLT(ERROR, "Error: Peer lacks a CCCD for the subscribable characteristic\n");
-        goto err;
-    }
-
-    ESP_LOGI(tag, "subscribe to mouse events, handle: 0x%02X", handle);
-
-    /*** Write 0x00 and 0x01 (The subscription code) to the CCCD ***/
-    value[0] = 1;
-    value[1] = 0;
-    rc = ble_gattc_write_flat(peer->conn_handle, handle,
-                              value, sizeof(value), on_characteristic_subscribe, NULL);
-    if (rc != 0)
-    {
-        MODLOG_DFLT(ERROR,
-                    "Error: Failed to subscribe to the subscribable characteristic; "
-                    "rc=%d\n",
-                    rc);
         /* Terminate the connection */
         ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+    else
+    {
+        ESP_LOGI(tag, "subscribe to mouse events, handle: 0x%02X", handle);
+
+        /*** Write 0x00 and 0x01 (The subscription code) to the CCCD ***/
+        value[0] = 1;
+        value[1] = 0;
+        rc = ble_gattc_write_flat(peer->conn_handle, handle,
+                                  value, sizeof(value), on_characteristic_subscribe, NULL);
+        if (rc != 0)
+        {
+            MODLOG_DFLT(ERROR,
+                        "Error: Failed to subscribe to the subscribable characteristic; "
+                        "rc=%d\n",
+                        rc);
+            /* Terminate the connection */
+            ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
     }
 
     return;
@@ -282,10 +289,12 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
 
             /* Remember peer. */
             rc = peer_add(event->connect.conn_handle);
-            if (rc != 0)
+            if (rc != 0 && rc != 2)
             {
                 MODLOG_DFLT(ERROR, "Failed to add peer; rc=%d\n", rc);
                 return 0;
+            } else if(rc == 2) {
+                MODLOG_DFLT(INFO, "Peer is already added; rc=%d\n", rc);
             }
 
             rc = ble_gap_security_initiate(event->connect.conn_handle);
@@ -315,6 +324,44 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         /* Connection terminated. */
         MODLOG_DFLT(INFO, "disconnect; reason=%d ", event->disconnect.reason);
+        scan();
+        // ble_gap_terminate(event->disconnect.conn.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+
+        // while (1)
+        // {
+        //     vTaskDelay(pdMS_TO_TICKS(2000));
+        //     uint8_t own_addr_type;
+        //     ble_addr_t *addr;
+
+        //     /* Figure out address to use for connect (no privacy for now) */
+        //     rc = ble_hs_id_infer_auto(0, &own_addr_type);
+        //     if (rc != 0)
+        //     {
+        //         MODLOG_DFLT(ERROR, "error determining address type; rc=%d\n", rc);
+        //         // return 0;
+        //     }
+        //     else
+        //     {
+        //         ESP_LOGI(tag, "address type found: %d", own_addr_type);
+        //     }
+
+        //     addr = &event->disconnect.conn.peer_id_addr;
+        //     rc = ble_gap_connect(own_addr_type, addr, 30000, NULL,
+        //                          on_gap_event_receive, NULL);
+        //     if (rc != 0)
+        //     {
+        //         MODLOG_DFLT(ERROR, "Error: Failed to connect to device; addr_type=%d "
+        //                            "addr=%s; rc=%d\n",
+        //                     addr->type, addr_str(addr->val), rc);
+        //         // return 0;
+        //     }
+        //     else
+        //     {
+        //         ESP_LOGI(tag, "Connected to mouse");
+        //         return 0;
+        //     }
+        // }
+
         return 0;
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
@@ -382,6 +429,8 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
             tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, modifier, keycode);
         }
 
+        free(buf);
+
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -396,7 +445,8 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
          * establish a new secure link.  This app sacrifices security for
          * convenience: just throw away the old bond and accept the new link.
          */
-            ESP_LOGI(tag, "Repeat pairing.");
+        ESP_LOGI(tag, "Repeat pairing.");
+        return 0;
     //     /* Delete the old bond. */
     //     rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
     //     assert(rc == 0);
@@ -461,6 +511,8 @@ static void on_sync(void)
     /* Make sure we have proper identity address set (public preferred) */
     rc = ble_hs_util_ensure_addr(0);
     assert(rc == 0);
+
+    scan();
 }
 
 void host_task(void *param)

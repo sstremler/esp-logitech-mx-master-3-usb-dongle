@@ -325,42 +325,6 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
         /* Connection terminated. */
         MODLOG_DFLT(INFO, "disconnect; reason=%d ", event->disconnect.reason);
         scan();
-        // ble_gap_terminate(event->disconnect.conn.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-
-        // while (1)
-        // {
-        //     vTaskDelay(pdMS_TO_TICKS(2000));
-        //     uint8_t own_addr_type;
-        //     ble_addr_t *addr;
-
-        //     /* Figure out address to use for connect (no privacy for now) */
-        //     rc = ble_hs_id_infer_auto(0, &own_addr_type);
-        //     if (rc != 0)
-        //     {
-        //         MODLOG_DFLT(ERROR, "error determining address type; rc=%d\n", rc);
-        //         // return 0;
-        //     }
-        //     else
-        //     {
-        //         ESP_LOGI(tag, "address type found: %d", own_addr_type);
-        //     }
-
-        //     addr = &event->disconnect.conn.peer_id_addr;
-        //     rc = ble_gap_connect(own_addr_type, addr, 30000, NULL,
-        //                          on_gap_event_receive, NULL);
-        //     if (rc != 0)
-        //     {
-        //         MODLOG_DFLT(ERROR, "Error: Failed to connect to device; addr_type=%d "
-        //                            "addr=%s; rc=%d\n",
-        //                     addr->type, addr_str(addr->val), rc);
-        //         // return 0;
-        //     }
-        //     else
-        //     {
-        //         ESP_LOGI(tag, "Connected to mouse");
-        //         return 0;
-        //     }
-        // }
 
         return 0;
 

@@ -43,6 +43,51 @@ This firmware retains the original MX Master 3 Mac report layout and GATT
 handles (`0x2f`/`0x33`, CCCDs `0x30`/`0x34`); other mouse models or firmware
 layouts may need different mappings.
 
+## Battery reporting
+
+After reconnecting and restoring HID subscriptions, the dongle subscribes to the
+standard Bluetooth Battery Level characteristic (service `0x180f`, characteristic
+`0x2a19`) before reading it, then polls once per minute as well. Notifications
+update the cached percentage immediately without waking a suspended USB host.
+On the tested MX Master 3 Mac, polling alone returned 100%; enabling notifications
+produced 20%, matching the direct Mac connection, and subsequent reads also
+returned 20%. The subscription is restored on every reconnect. Battery-read failures do not
+disconnect the mouse. Unknown, malformed, or disconnected readings are not
+reported as zero percent.
+
+USB feature report 3 contains a single byte, 0–100 percent, using Generic Device
+Controls / Battery Strength (`0x06/0x20`) inside the mouse collection. The USB
+control request returns the cached value without blocking on Bluetooth or taking
+time on the mouse's interrupt endpoint. Charging state is not inferred from the
+percentage. This is a standard HID report, not Logitech HID++ emulation.
+
+Linux's generic HID driver supports this report through `CONFIG_HID_BATTERY_STRENGTH`.
+Ubuntu's UPower/desktop can use the resulting device battery; notification policy
+depends on the desktop. Native battery displays and notifications on macOS and
+Windows are **not guaranteed** for a generic USB HID receiver. No companion
+software or drivers are installed by this project.
+
+On Ubuntu, reconnect the USB/OTG cable after flashing, move the mouse, and run
+`upower -e` followed by `upower -i DEVICE_PATH` for the new device. The underlying
+reading is also available in `/sys/class/power_supply/hid-*/capacity`. Check for
+`Battery notification: raw=... (N%)` or `Battery read: raw=... (N%)` in the UART logs. Test again after power-cycling the mouse.
+If no Battery Level characteristic is available, the firmware logs that fact;
+it does not invent a battery value.
+
+Host-side cache tests (no board required):
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -I main main/battery_report.c tests/test_battery_report.c -o /tmp/test-dongle-battery
+/tmp/test-dongle-battery
+python tests/check_hid_descriptor.py build/esp-logitech-mx-master-3-usb-dongle.elf
+```
+
+The descriptor check uses ESP-IDF's Python environment. It reads the compiled
+descriptor from the ELF and checks the battery usage, range, collection, report
+length, and unchanged mouse/keyboard input sizes.
+
+Compatibility reference: [Linux HID battery implementation](https://github.com/torvalds/linux/blob/v6.8/drivers/hid/hid-input.c).
+
 ## Hardware regression checks
 
 Run these after flashing; a successful build alone does not validate radio or

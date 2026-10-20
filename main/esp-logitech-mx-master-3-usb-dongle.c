@@ -12,6 +12,7 @@
 #include "peer.h"
 #include "tinyusb.h"
 #include <inttypes.h>
+#include "battery_report.h"
 
 #define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_HID * TUD_HID_DESC_LEN)
 
@@ -24,7 +25,12 @@ static const char *tag = "LOGITECH_DONGLE";
 
 const uint8_t hid_report_descriptor[] = {
     TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(HID_ITF_PROTOCOL_KEYBOARD)),
-    TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(HID_ITF_PROTOCOL_MOUSE))};
+    TUD_HID_REPORT_DESC_MOUSE(
+        /* Feature lives in the mouse application collection, with its own ID.
+         * Reset the usage page before TinyUSB emits the Pointer usage. */
+        DONGLE_BATTERY_REPORT_DESCRIPTOR,
+        HID_USAGE_PAGE(HID_USAGE_PAGE_DESKTOP),
+        HID_REPORT_ID(HID_ITF_PROTOCOL_MOUSE))};
 
 const char *hid_string_descriptor[5] = {
     (char[]){0x09, 0x04},    // 0: is supported language is English (0x0409)
@@ -46,6 +52,19 @@ void ble_store_config_init(void);
 static void scan(void);
 static struct ble_npl_callout reconnect_timer;
 static uint16_t mouse_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static struct ble_npl_callout battery_timer;
+static uint16_t battery_value_handle;
+static bool battery_ready;
+static void read_battery_status(struct ble_npl_event *event);
+static void start_battery_monitor(uint16_t conn_handle);
+
+static void stop_battery_monitor(void)
+{
+    ble_npl_callout_stop(&battery_timer);
+    battery_value_handle = 0;
+    battery_ready = false;
+    battery_report_invalidate();
+}
 
 /* Run recovery on the host queue, never concurrently with GAP callbacks. */
 static void reconnect_tick(struct ble_npl_event *event)
@@ -84,11 +103,10 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
 {
     (void)instance;
-    (void)report_id;
-    (void)report_type;
-    (void)buffer;
-    (void)reqlen;
-
+    if (report_type == HID_REPORT_TYPE_FEATURE && report_id == DONGLE_BATTERY_REPORT_ID) {
+        /* TinyUSB supplies the report ID; return only the payload here. */
+        return battery_report_get(buffer, reqlen);
+    }
     return 0;
 }
 
@@ -122,68 +140,117 @@ static int on_characteristic_subscribe(uint16_t conn_handle,
         if (rc != 0) {
             ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         }
+    } else if ((uintptr_t)arg == 0x0034) {
+        start_battery_monitor(conn_handle);
     }
     return 0;
 }
 
-static int on_characteristic_read(uint16_t conn_handle,
-                                  const struct ble_gatt_error *error,
-                                  struct ble_gatt_attr *attr,
-                                  void *arg)
+static int on_battery_read(uint16_t conn_handle,
+                           const struct ble_gatt_error *error,
+                           struct ble_gatt_attr *attr, void *arg)
 {
-    MODLOG_DFLT(INFO,
-                "Read complete for the subscribable characteristic; "
-                "status=%d conn_handle=%d",
-                error->status, conn_handle);
-
-    if (error->status == 0)
-    {
-        MODLOG_DFLT(INFO, " attr_handle=%d value=", attr->handle);
-        ESP_LOGI(tag, "Read successful. Value:");
-
-        for (int i = 0; i < attr->om->om_len; i++)
-        {
-            ESP_LOGI(tag, "0x%02X ", attr->om->om_data[i]);
-        }
+    (void)arg;
+    if (conn_handle != mouse_conn_handle || battery_value_handle == 0) {
+        return 0;
     }
-
-    MODLOG_DFLT(INFO, "\n");
-
+    uint8_t level;
+    if (error->status == 0 && attr != NULL && attr->om != NULL &&
+        OS_MBUF_PKTLEN(attr->om) == 1 &&
+        os_mbuf_copydata(attr->om, 0, 1, &level) == 0 &&
+        battery_report_update(level)) {
+        ESP_LOGI(tag, "Battery read: raw=0x%02x (%u%%)", level, (unsigned)level);
+    } else {
+        battery_report_invalidate();
+        ESP_LOGW(tag, "Battery reading unavailable; status=%d", error->status);
+    }
+    /* Schedule after completion: never stack up outstanding reads. */
+    ble_npl_callout_reset(&battery_timer, ble_npl_time_ms_to_ticks32(60000));
     return 0;
 }
 
-static void read_battery_status(const struct peer *peer)
+static void read_battery_status(struct ble_npl_event *event)
 {
-    const struct peer_chr *chr;
-    int rc;
-
-    chr = peer_chr_find_uuid(peer,
-                             (ble_uuid_t *)&battery_svc_uuid,
-                             (ble_uuid_t *)&battery_chr_uuid);
-    if (chr == NULL)
-    {
-        MODLOG_DFLT(ERROR, "Error: Peer doesn't have the custom subscribable characteristic\n");
-        /* Terminate the connection */
-        ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    (void)event;
+    if (mouse_conn_handle == BLE_HS_CONN_HANDLE_NONE || battery_value_handle == 0) {
+        return;
     }
-    else
-    {
-        ESP_LOGI(tag, "read handle: 0x%02X", chr->chr.val_handle);
+    if (!battery_ready) {
+        start_battery_monitor(mouse_conn_handle);
+        return;
+    }
+    int rc = ble_gattc_read(mouse_conn_handle, battery_value_handle, on_battery_read, NULL);
+    if (rc != 0) {
+        battery_report_invalidate();
+        ESP_LOGW(tag, "Battery read could not start: %d", rc);
+        ble_npl_callout_reset(&battery_timer, ble_npl_time_ms_to_ticks32(60000));
+    }
+}
 
-        rc = ble_gattc_read(peer->conn_handle, chr->chr.val_handle, on_characteristic_read, NULL);
+static void accept_battery_level(const struct os_mbuf *om, const char *source)
+{
+    uint8_t level;
+    if (om != NULL && OS_MBUF_PKTLEN(om) == 1 &&
+        os_mbuf_copydata(om, 0, 1, &level) == 0 && battery_report_update(level)) {
+        ESP_LOGI(tag, "Battery %s: raw=0x%02x (%u%%)", source, level, (unsigned)level);
+    } else {
+        battery_report_invalidate();
+        ESP_LOGW(tag, "Invalid battery %s", source);
+    }
+}
 
-        if (rc != 0)
-        {
-            MODLOG_DFLT(ERROR,
-                        "Error: Failed to read the custom subscribable characteristic; "
-                        "rc=%d\n",
-                        rc);
-            /* Terminate the connection */
-            ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+static int on_battery_subscribe(uint16_t conn_handle,
+                                const struct ble_gatt_error *error,
+                                struct ble_gatt_attr *attr, void *arg)
+{
+    (void)attr;
+    (void)arg;
+    if (conn_handle != mouse_conn_handle || battery_value_handle == 0) {
+        return 0;
+    }
+    ESP_LOGI(tag, "Battery subscription status=%d", error->status);
+    if (error->status != 0) {
+        battery_report_invalidate();
+        ble_npl_callout_reset(&battery_timer, ble_npl_time_ms_to_ticks32(60000));
+        return 0;
+    }
+    battery_ready = true;
+    read_battery_status(NULL);
+    return 0;
+}
+
+static void start_battery_monitor(uint16_t conn_handle)
+{
+    const struct peer *peer = peer_find(conn_handle);
+    if (peer == NULL) {
+        return;
+    }
+    const struct peer_chr *chr = peer_chr_find_uuid(peer,
+        (ble_uuid_t *)&battery_svc_uuid, (ble_uuid_t *)&battery_chr_uuid);
+    if (chr == NULL || !(chr->chr.properties & BLE_GATT_CHR_PROP_READ)) {
+        ESP_LOGW(tag, "Mouse has no readable Bluetooth Battery Level characteristic");
+        return;
+    }
+    battery_value_handle = chr->chr.val_handle;
+    const struct peer_dsc *cccd = peer_dsc_find_uuid(peer,
+        (ble_uuid_t *)&battery_svc_uuid, (ble_uuid_t *)&battery_chr_uuid,
+        BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16));
+    /* This mouse initially reads as 100% until notifications are enabled.
+     * Subscribe before reading to initialize its current battery measurement. */
+    if ((chr->chr.properties & BLE_GATT_CHR_PROP_NOTIFY) && cccd != NULL) {
+        const uint8_t enabled[] = {1, 0};
+        int rc = ble_gattc_write_flat(conn_handle, cccd->dsc.handle, enabled,
+                                     sizeof(enabled), on_battery_subscribe, NULL);
+        if (rc == 0) {
+            return;
         }
+        ESP_LOGW(tag, "Battery subscription could not start: %d", rc);
+        battery_report_invalidate();
+        ble_npl_callout_reset(&battery_timer, ble_npl_time_ms_to_ticks32(60000));
+        return;
     }
-
-    return;
+    battery_ready = true;
+    read_battery_status(NULL);
 }
 
 static void subscribe_to_mouse_events(const struct peer *peer, uint16_t handle)
@@ -245,7 +312,7 @@ static void on_service_discovery_complete(const struct peer *peer, int status, v
     // Subscribe to thumb button events.
     subscribe_to_mouse_events(peer, 0x0030);
     // The completion callback subscribes to scroll and click events next.
-    // read_battery_status(peer);
+    // Battery polling starts after both HID subscriptions succeed.
 }
 
 static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
@@ -367,6 +434,7 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         /* Connection terminated. */
         MODLOG_DFLT(INFO, "disconnect; reason=%d ", event->disconnect.reason);
+        stop_battery_monitor();
         peer_delete(event->disconnect.conn.conn_handle);
         mouse_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         scan();
@@ -398,6 +466,11 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_NOTIFY_RX:
+        if (battery_value_handle != 0 && event->notify_rx.conn_handle == mouse_conn_handle &&
+            event->notify_rx.attr_handle == battery_value_handle) {
+            accept_battery_level(event->notify_rx.om, "notification");
+            return 0; // Battery traffic must not wake a sleeping USB host.
+        }
         /* Peer sent us a notification or indication. */
         int len = OS_MBUF_PKTLEN(event->notify_rx.om);
         MODLOG_DFLT(DEBUG, "received %s; conn_handle=%d attr_handle=%d "
@@ -513,6 +586,7 @@ static void on_reset(int reason)
 {
     MODLOG_DFLT(ERROR, "Resetting state; reason=%d\n", reason);
     ble_npl_callout_stop(&reconnect_timer);
+    stop_battery_monitor();
     if (mouse_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         peer_delete(mouse_conn_handle);
         mouse_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -582,6 +656,7 @@ void app_main(void)
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_npl_callout_init(&battery_timer, nimble_port_get_dflt_eventq(), read_battery_status, NULL);
     ble_npl_callout_init(&reconnect_timer, nimble_port_get_dflt_eventq(), reconnect_tick, NULL);
 
     /* Initialize data structures to track connected peers. */

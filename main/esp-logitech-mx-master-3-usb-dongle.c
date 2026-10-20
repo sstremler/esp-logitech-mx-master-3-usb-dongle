@@ -4,6 +4,7 @@
 #include "nimble/nimble_port.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
+#include "host/ble_store.h"
 #include "services/gap/ble_svc_gap.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -43,6 +44,37 @@ static const uint8_t hid_configuration_descriptor[] = {
 
 void ble_store_config_init(void);
 static void scan(void);
+static struct ble_npl_callout reconnect_timer;
+static uint16_t mouse_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+
+/* Run recovery on the host queue, never concurrently with GAP callbacks. */
+static void reconnect_tick(struct ble_npl_event *event)
+{
+    (void)event;
+    if (ble_hs_synced()) {
+        scan();
+        ble_npl_callout_reset(&reconnect_timer, ble_npl_time_ms_to_ticks32(2000));
+    }
+}
+
+static bool is_mouse(const struct ble_gap_disc_desc *disc,
+                     const struct ble_hs_adv_fields *fields)
+{
+    ble_addr_t bonds[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+    int count = 0;
+    if (ble_store_util_bonded_peers(bonds, &count, MYNEWT_VAL(BLE_STORE_MAX_BONDS)) == 0) {
+        for (int i = 0; i < count; ++i) {
+            /* Resolved identity address types differ by 2 from public/random. */
+            if ((bonds[i].type & 1) == (disc->addr.type & 1) &&
+                memcmp(bonds[i].val, disc->addr.val, 6) == 0) {
+                return true;
+            }
+        }
+    }
+    static const char name[] = "MX Master 3 Mac";
+    return fields->name != NULL && fields->name_len == sizeof(name) - 1 &&
+           memcmp(fields->name, name, sizeof(name) - 1) == 0;
+}
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
@@ -80,6 +112,17 @@ static int on_characteristic_subscribe(uint16_t conn_handle,
         print_mbuf(attr->om);
     }
 
+    if (error->status != 0) {
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    } else if ((uintptr_t)arg == 0x0030) {
+        /* Serialize CCCD writes without blocking the NimBLE host task. */
+        const uint8_t enabled[] = {1, 0};
+        int rc = ble_gattc_write_flat(conn_handle, 0x0034, enabled, sizeof(enabled),
+                                     on_characteristic_subscribe, (void *)(uintptr_t)0x0034);
+        if (rc != 0) {
+            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
+    }
     return 0;
 }
 
@@ -167,7 +210,7 @@ static void subscribe_to_mouse_events(const struct peer *peer, uint16_t handle)
         value[0] = 1;
         value[1] = 0;
         rc = ble_gattc_write_flat(peer->conn_handle, handle,
-                                  value, sizeof(value), on_characteristic_subscribe, NULL);
+                                  value, sizeof(value), on_characteristic_subscribe, (void *)(uintptr_t)handle);
         if (rc != 0)
         {
             MODLOG_DFLT(ERROR,
@@ -201,9 +244,7 @@ static void on_service_discovery_complete(const struct peer *peer, int status, v
 
     // Subscribe to thumb button events.
     subscribe_to_mouse_events(peer, 0x0030);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    // Subscribe to scroll and click events.
-    subscribe_to_mouse_events(peer, 0x0034);
+    // The completion callback subscribes to scroll and click events next.
     // read_battery_status(peer);
 }
 
@@ -218,15 +259,11 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISC:
         /* A new device was discovered. */
         rc = ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data);
-        char s[BLE_HS_ADV_MAX_SZ];
-
-        if (fields.name != NULL)
+        if (rc != 0 || mouse_conn_handle != BLE_HS_CONN_HANDLE_NONE || ble_gap_conn_active()) {
+            return 0;
+        }
         {
-            assert(fields.name_len < sizeof s - 1);
-            memcpy(s, fields.name, fields.name_len);
-            s[fields.name_len] = '\0';
-
-            if (strcmp(s, "MX Master 3 Mac") == 0)
+            if (is_mouse(&event->disc, &fields))
             {
                 ESP_LOGI(tag, "Found mouse");
                 print_bytes(event->disc.addr.val, 6);
@@ -269,7 +306,7 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
                 }
                 else
                 {
-                    ESP_LOGI(tag, "Connected to mouse");
+                    ESP_LOGI(tag, "Connecting to mouse");
                 }
             }
         }
@@ -278,52 +315,60 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_LINK_ESTAB:
         /* A new connection was established or a connection attempt failed. */
-        if (event->connect.status == 0)
+        if (event->link_estab.status == 0)
         {
             MODLOG_DFLT(INFO, "Connection established ");
 
-            rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
+            rc = ble_gap_conn_find(event->link_estab.conn_handle, &desc);
             assert(rc == 0);
             print_conn_desc(&desc);
             MODLOG_DFLT(INFO, "\n");
 
+            mouse_conn_handle = event->link_estab.conn_handle;
             /* Remember peer. */
-            rc = peer_add(event->connect.conn_handle);
-            if (rc != 0 && rc != 2)
+            rc = peer_add(event->link_estab.conn_handle);
+            if (rc != 0 && rc != BLE_HS_EALREADY)
             {
                 MODLOG_DFLT(ERROR, "Failed to add peer; rc=%d\n", rc);
+                ble_gap_terminate(mouse_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
                 return 0;
-            } else if(rc == 2) {
+            } else if(rc == BLE_HS_EALREADY) {
                 MODLOG_DFLT(INFO, "Peer is already added; rc=%d\n", rc);
             }
 
-            rc = ble_gap_security_initiate(event->connect.conn_handle);
+            rc = ble_gap_security_initiate(event->link_estab.conn_handle);
             if (rc != 0)
             {
                 MODLOG_DFLT(INFO, "Security could not be initiated, rc = %d\n", rc);
-                return ble_gap_terminate(event->connect.conn_handle,
+                return ble_gap_terminate(event->link_estab.conn_handle,
                                          BLE_ERR_REM_USER_CONN_TERM);
             }
             else
             {
-                MODLOG_DFLT(INFO, "Connection secured\n");
+                MODLOG_DFLT(INFO, "Security procedure started\n");
             }
         }
         else
         {
             MODLOG_DFLT(ERROR, "Error: Connection failed; status=%d\n",
-                        event->connect.status);
+                        event->link_estab.status);
         }
 
         return 0;
 
     case BLE_GAP_EVENT_CONNECT:
         MODLOG_DFLT(INFO, "connect; status=%d ", event->connect.status);
+        if (event->connect.status == 0) {
+            /* CONNECT precedes LINK_ESTAB while remote features are read. */
+            mouse_conn_handle = event->connect.conn_handle;
+        }
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
         /* Connection terminated. */
         MODLOG_DFLT(INFO, "disconnect; reason=%d ", event->disconnect.reason);
+        peer_delete(event->disconnect.conn.conn_handle);
+        mouse_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         scan();
 
         return 0;
@@ -341,28 +386,41 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
         assert(rc == 0);
         print_conn_desc(&desc);
 
-        /*** Go for service discovery after encryption has been successfully enabled ***/
-        rc = peer_disc_all(event->connect.conn_handle, on_service_discovery_complete, NULL);
-        if (rc != 0)
-        {
-            MODLOG_DFLT(ERROR, "Failed to discover services; rc=%d\n", rc);
+        if (event->enc_change.status != 0 || !desc.sec_state.encrypted) {
+            ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             return 0;
         }
-
+        rc = peer_disc_all(event->enc_change.conn_handle, on_service_discovery_complete, NULL);
+        if (rc != 0) {
+            ESP_LOGW(tag, "Service discovery failed to start: %d", rc);
+            ble_gap_terminate(event->enc_change.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        }
         return 0;
 
     case BLE_GAP_EVENT_NOTIFY_RX:
         /* Peer sent us a notification or indication. */
         int len = OS_MBUF_PKTLEN(event->notify_rx.om);
-        MODLOG_DFLT(INFO, "received %s; conn_handle=%d attr_handle=%d "
+        MODLOG_DFLT(DEBUG, "received %s; conn_handle=%d attr_handle=%d "
                           "attr_len=%d\n",
                     event->notify_rx.indication ? "indication" : "notification",
                     event->notify_rx.conn_handle,
                     event->notify_rx.attr_handle,
                     len);
 
-        uint8_t *buf = malloc(len + 1);
-        os_mbuf_copydata(event->notify_rx.om, 0, len, buf);
+        uint8_t buf[7] = {0};
+        if ((event->notify_rx.attr_handle != 0x33 && event->notify_rx.attr_handle != 0x2F) ||
+            (event->notify_rx.attr_handle == 0x33 && len < 7) || len < 1 ||
+            os_mbuf_copydata(event->notify_rx.om, 0, len < (int)sizeof(buf) ? len : sizeof(buf), buf) != 0) {
+            return 0;
+        }
+        if (tud_suspended()) {
+            /* TinyUSB checks whether the host has enabled remote wakeup. */
+            tud_remote_wakeup();
+            return 0;
+        }
+        if (!tud_hid_ready()) {
+            return 0;
+        }
 
         if (event->notify_rx.attr_handle == 0x33)
         {
@@ -393,8 +451,6 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
             tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, modifier, keycode);
         }
 
-        free(buf);
-
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -405,21 +461,13 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_REPEAT_PAIRING:
-        /* We already have a bond with the peer, but it is attempting to
-         * establish a new secure link.  This app sacrifices security for
-         * convenience: just throw away the old bond and accept the new link.
-         */
-        ESP_LOGI(tag, "Repeat pairing.");
-        return 0;
-    //     /* Delete the old bond. */
-    //     rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
-    //     assert(rc == 0);
-    //     ble_store_util_delete_peer(&desc.peer_id_addr);
-
-    //     /* Return BLE_GAP_REPEAT_PAIRING_RETRY to indicate that the host should
-    //      * continue with the pairing operation.
-    //      */
-    //     return BLE_GAP_REPEAT_PAIRING_RETRY;
+        /* The mouse has forgotten its bond (for example after re-pairing its
+         * Easy-Switch slot). Replace only that peer's stale keys. */
+        rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
+        if (rc != 0 || ble_store_util_delete_peer(&desc.peer_id_addr) != 0) {
+            return BLE_GAP_REPEAT_PAIRING_IGNORE;
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
     default:
         return 0;
     }
@@ -428,9 +476,13 @@ static int on_gap_event_receive(struct ble_gap_event *event, void *arg)
 static void scan(void)
 {
     uint8_t own_addr_type;
-    struct ble_gap_disc_params disc_params;
+    struct ble_gap_disc_params disc_params = {0};
     int rc;
 
+    if (mouse_conn_handle != BLE_HS_CONN_HANDLE_NONE ||
+        ble_gap_conn_active() || ble_gap_disc_active()) {
+        return;
+    }
     rc = ble_hs_id_infer_auto(0, &own_addr_type);
     if (rc != 0)
     {
@@ -438,16 +490,10 @@ static void scan(void)
         return;
     }
 
-    /* Tell the controller to filter duplicates; we don't want to process
-     * repeated advertisements from the same device.
-     */
-    disc_params.filter_duplicates = 1;
-
-    /**
-     * Perform a passive scan.  I.e., don't send follow-up scan requests to
-     * each advertiser.
-     */
-    disc_params.passive = 1;
+    /* Wake advertisements may omit the name; actively request scan responses.
+     * Allow repeats so a later response can make an advertiser recognizable. */
+    disc_params.filter_duplicates = 0;
+    disc_params.passive = 0;
 
     disc_params.itvl = 10;
     disc_params.window = 10;
@@ -466,6 +512,11 @@ static void scan(void)
 static void on_reset(int reason)
 {
     MODLOG_DFLT(ERROR, "Resetting state; reason=%d\n", reason);
+    ble_npl_callout_stop(&reconnect_timer);
+    if (mouse_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        peer_delete(mouse_conn_handle);
+        mouse_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
 }
 
 static void on_sync(void)
@@ -477,6 +528,7 @@ static void on_sync(void)
     assert(rc == 0);
 
     scan();
+    ble_npl_callout_reset(&reconnect_timer, ble_npl_time_ms_to_ticks32(2000));
 }
 
 void host_task(void *param)
@@ -527,6 +579,10 @@ void app_main(void)
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_npl_callout_init(&reconnect_timer, nimble_port_get_dflt_eventq(), reconnect_tick, NULL);
 
     /* Initialize data structures to track connected peers. */
     int rc = peer_init(MYNEWT_VAL(BLE_MAX_CONNECTIONS), 64, 64, 64);

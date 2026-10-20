@@ -6,7 +6,7 @@ USB mouse and keyboard reports.
 ## Build and flash
 
 ```sh
-source "/Users/szabolcs.stremler/.espressif/tools/activate_idf_v5.4.sh"
+source "/Users/user/.espressif/tools/activate_idf_v5.4.sh"
 idf.py set-target esp32s3
 idf.py build
 idf.py -p /dev/cu.usbmodemYOUR_PORT flash monitor
